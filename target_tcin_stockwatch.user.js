@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Target Stock Watch (Page Alert Only)
 // @namespace    local.target.stockwatch
-// @version      0.8
-// @description  Watches Target product pages and alerts only when a real purchase control is actionable and no Out of Stock state is visible. No cart/API actions.
+// @version      0.9
+// @description  Uses two rotating Target product-page workers to watch six TCINs. Alerts only when a real purchase control is actionable and no Out of Stock state is visible.
 // @match        https://www.target.com/*
 // @run-at       document-idle
 // @grant        none
@@ -20,10 +20,12 @@
     { tcin: '1010892070', label: 'Target item 1010892070' },
   ];
 
-  const REFRESH_MS = 3000;
-  const BUTTON_SCAN_MS = 200;
+  const WORKER_COUNT = 2;
+  const SCAN_MS = 200;
   const MIN_SETTLE_MS = 1200;
   const REQUIRED_STABLE_SCANS = 3;
+  const MAX_DWELL_MS = 3200;
+  const ROTATE_DELAY_MS = 250;
 
   const KEY_ENABLED = 'tsw.enabled';
   const KEY_HIT = 'tsw.hit';
@@ -31,10 +33,11 @@
 
   let audioCtx = null;
   let controllerTimer = null;
-  let workerReloadTimer = null;
   let workerScanTimer = null;
+  let rotateTimer = null;
   let hitThisLoad = false;
   let stableActionableScans = 0;
+  let rotating = false;
   const workerStartedAt = Date.now();
 
   let globalStatus = null;
@@ -43,9 +46,15 @@
   let rows = null;
 
   const params = new URLSearchParams(location.search);
-  const isWorker = params.get('tsw_worker') === '1' || /^tsw-\d+$/.test(window.name);
+  const isWorker = params.get('tsw_worker') === '1';
+  const workerSlot = Number(params.get('slot'));
+  const workerPos = Number(params.get('pos'));
   const currentTcin = getCurrentTcin();
   const currentItem = ITEMS.find(item => item.tcin === currentTcin) || null;
+
+  function assignmentsForSlot(slot) {
+    return ITEMS.filter((_, index) => index % WORKER_COUNT === slot);
+  }
 
   function getCurrentTcin() {
     const match = location.pathname.match(/A-(\d+)/i);
@@ -57,8 +66,8 @@
     return `https://www.target.com/p/A-${tcin}`;
   }
 
-  function workerUrl(item) {
-    return `${productUrl(item)}?tsw_worker=1`;
+  function workerUrl(item, slot, pos) {
+    return `${productUrl(item)}?tsw_worker=1&slot=${slot}&pos=${pos}`;
   }
 
   function enabled() {
@@ -150,10 +159,8 @@
     while ((textNode = walker.nextNode())) {
       const text = normalizeText(textNode.nodeValue);
       if (!/^(out of stock|sold out)[.!]?$/i.test(text)) continue;
-
       const parent = textNode.parentElement;
       if (!parent || !visible(parent)) continue;
-
       const rect = parent.getBoundingClientRect();
       if (rect.top > 2000 || rect.bottom < 0) continue;
       return true;
@@ -164,24 +171,17 @@
 
   function resolveInteractiveControl(node) {
     if (!node) return null;
-
     if (node.matches?.('button, a, [role="button"]')) return node;
-
-    const child = node.querySelector?.('button, a, [role="button"]');
-    if (child) return child;
-
-    return node.closest?.('button, a, [role="button"]') || null;
+    return node.querySelector?.('button, a, [role="button"]') ||
+      node.closest?.('button, a, [role="button"]') || null;
   }
 
   function isActuallyActionable(control) {
     if (!control || !visible(control)) return false;
-
     if (control.matches?.(':disabled')) return false;
     if ('disabled' in control && control.disabled) return false;
     if (control.hasAttribute?.('disabled')) return false;
-
-    const ariaDisabled = control.getAttribute?.('aria-disabled');
-    if (ariaDisabled && ariaDisabled.toLowerCase() === 'true') return false;
+    if ((control.getAttribute?.('aria-disabled') || '').toLowerCase() === 'true') return false;
 
     const disabledAncestor = control.closest?.(
       '[aria-disabled="true"], [disabled], [data-disabled="true"]'
@@ -194,27 +194,14 @@
     const classText = `${control.className || ''} ${control.parentElement?.className || ''}`.toLowerCase();
     if (/\bdisabled\b/.test(classText)) return false;
 
-    const rect = control.getBoundingClientRect();
-    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1);
-    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1);
-
-    if (rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth) {
-      const topElement = document.elementFromPoint(x, y);
-      if (topElement && topElement !== control && !control.contains(topElement) && !topElement.contains(control)) {
-        return false;
-      }
-    }
-
     return true;
   }
 
   function candidateFromNode(node, selector) {
     const control = resolveInteractiveControl(node);
     if (!isActuallyActionable(control)) return null;
-
     const text = normalizeText(control.innerText || control.textContent || node.innerText || node.textContent);
     if (!/^(preorder now|preorder|ship it|add to cart|pick it up)$/i.test(text)) return null;
-
     return { el: control, text, selector };
   }
 
@@ -227,19 +214,16 @@
     ];
 
     for (const selector of selectors) {
-      const nodes = [...document.querySelectorAll(selector)];
-      for (const node of nodes) {
+      for (const node of document.querySelectorAll(selector)) {
         const candidate = candidateFromNode(node, selector);
         if (candidate) return candidate;
       }
     }
 
-    const buttons = [...document.querySelectorAll('button, [role="button"]')];
-    for (const button of buttons) {
+    for (const button of document.querySelectorAll('button, [role="button"]')) {
       if (!isActuallyActionable(button)) continue;
       const rect = button.getBoundingClientRect();
       if (rect.top > 1800) continue;
-
       const text = normalizeText(button.innerText || button.textContent);
       if (/^(preorder now|preorder|ship it|add to cart|pick it up)$/i.test(text)) {
         return { el: button, text, selector: 'text-fallback' };
@@ -249,33 +233,11 @@
     return null;
   }
 
-  function emitHit(item, control) {
-    if (hitThisLoad || !enabled()) return;
-    if (pageShowsOutOfStock()) return;
-    hitThisLoad = true;
-
-    const hit = {
-      tcin: item.tcin,
-      label: item.label,
-      buttonText: control.text || 'Purchasable',
-      selector: control.selector,
-      at: Date.now()
-    };
-
-    setStatus(item.tcin, `🟢 ${hit.buttonText} actionable; no Out of Stock state @ ${nowTime()}`);
-    localStorage.setItem(KEY_HIT, JSON.stringify(hit));
-    localStorage.setItem(KEY_ENABLED, '0');
-
-    stopWorkerTimers();
-    renderWorkerBadge(`FOUND — ${hit.buttonText}`);
-    try { window.focus(); } catch (_) {}
-  }
-
   function stopWorkerTimers() {
-    if (workerReloadTimer) clearTimeout(workerReloadTimer);
     if (workerScanTimer) clearInterval(workerScanTimer);
-    workerReloadTimer = null;
+    if (rotateTimer) clearTimeout(rotateTimer);
     workerScanTimer = null;
+    rotateTimer = null;
   }
 
   function renderWorkerBadge(text) {
@@ -284,16 +246,9 @@
       badge = document.createElement('div');
       badge.id = 'tsw-worker-badge';
       badge.style.cssText = [
-        'position:fixed',
-        'right:12px',
-        'bottom:12px',
-        'z-index:2147483647',
-        'background:#fff',
-        'color:#111',
-        'border:2px solid #cc0000',
-        'border-radius:8px',
-        'padding:7px 10px',
-        'font:12px/1.3 system-ui,sans-serif',
+        'position:fixed','right:12px','bottom:12px','z-index:2147483647',
+        'background:#fff','color:#111','border:2px solid #cc0000','border-radius:8px',
+        'padding:7px 10px','font:12px/1.3 system-ui,sans-serif',
         'box-shadow:0 3px 12px rgba(0,0,0,.2)'
       ].join(';');
       document.body.appendChild(badge);
@@ -301,16 +256,56 @@
     badge.textContent = `Target Watch: ${text}`;
   }
 
+  function rotateToNext() {
+    if (rotating || !enabled()) return;
+    rotating = true;
+    stopWorkerTimers();
+
+    const assigned = assignmentsForSlot(workerSlot);
+    if (!assigned.length) return;
+    const safePos = Number.isInteger(workerPos) && workerPos >= 0 ? workerPos % assigned.length : 0;
+    const nextPos = (safePos + 1) % assigned.length;
+    const nextItem = assigned[nextPos];
+    setStatus(nextItem.tcin, `Queued on worker ${workerSlot + 1} @ ${nowTime()}`);
+
+    rotateTimer = setTimeout(() => {
+      location.replace(workerUrl(nextItem, workerSlot, nextPos));
+    }, ROTATE_DELAY_MS);
+  }
+
+  function emitHit(item, control) {
+    if (hitThisLoad || !enabled() || pageShowsOutOfStock()) return;
+    hitThisLoad = true;
+
+    const hit = {
+      tcin: item.tcin,
+      label: item.label,
+      buttonText: control.text || 'Purchasable',
+      slot: workerSlot,
+      at: Date.now()
+    };
+
+    setStatus(item.tcin, `🟢 ${hit.buttonText} actionable; no Out of Stock state @ ${nowTime()}`);
+    localStorage.setItem(KEY_HIT, JSON.stringify(hit));
+    localStorage.setItem(KEY_ENABLED, '0');
+    stopWorkerTimers();
+    renderWorkerBadge(`FOUND — ${hit.buttonText}`);
+    try { window.focus(); } catch (_) {}
+  }
+
   function startWorker() {
-    if (!currentItem) return;
+    if (!currentItem || !Number.isInteger(workerSlot) || workerSlot < 0 || workerSlot >= WORKER_COUNT) return;
+
+    const assigned = assignmentsForSlot(workerSlot);
+    if (!assigned.some(item => item.tcin === currentItem.tcin)) return;
 
     if (!enabled()) {
       renderWorkerBadge('Paused');
       return;
     }
 
-    setStatus(currentItem.tcin, `Watching page @ ${nowTime()}`);
-    renderWorkerBadge(`Watching ${currentItem.tcin}`);
+    setStatus(currentItem.tcin, `Checking on worker ${workerSlot + 1} @ ${nowTime()}`);
+    renderWorkerBadge(`Checking ${currentItem.tcin}`);
 
     const scan = () => {
       if (!enabled()) {
@@ -319,41 +314,41 @@
         return;
       }
 
+      const elapsed = Date.now() - workerStartedAt;
+      if (elapsed < MIN_SETTLE_MS) return;
+
       if (pageShowsOutOfStock()) {
         stableActionableScans = 0;
         setStatus(currentItem.tcin, `Out of Stock @ ${nowTime()}`);
-        renderWorkerBadge('Out of Stock');
-        return;
-      }
-
-      if (Date.now() - workerStartedAt < MIN_SETTLE_MS) {
-        stableActionableScans = 0;
-        renderWorkerBadge(`Checking ${currentItem.tcin}`);
+        renderWorkerBadge(`${currentItem.tcin}: Out of Stock`);
+        rotateToNext();
         return;
       }
 
       const control = findPurchaseControl();
-      if (!control) {
-        stableActionableScans = 0;
-        setStatus(currentItem.tcin, `No actionable purchase control @ ${nowTime()}`);
-        renderWorkerBadge(`Watching ${currentItem.tcin}`);
+      if (control) {
+        stableActionableScans += 1;
+        setStatus(
+          currentItem.tcin,
+          `${control.text} actionable (${stableActionableScans}/${REQUIRED_STABLE_SCANS}) @ ${nowTime()}`
+        );
+
+        if (stableActionableScans >= REQUIRED_STABLE_SCANS && !pageShowsOutOfStock()) {
+          emitHit(currentItem, control);
+        }
         return;
       }
 
-      stableActionableScans += 1;
-      setStatus(
-        currentItem.tcin,
-        `${control.text} actionable (${stableActionableScans}/${REQUIRED_STABLE_SCANS}) @ ${nowTime()}`
-      );
-
-      if (stableActionableScans >= REQUIRED_STABLE_SCANS && !pageShowsOutOfStock()) {
-        emitHit(currentItem, control);
+      stableActionableScans = 0;
+      if (elapsed >= MAX_DWELL_MS) {
+        setStatus(currentItem.tcin, `No actionable purchase control @ ${nowTime()}`);
+        renderWorkerBadge(`${currentItem.tcin}: no stock signal`);
+        rotateToNext();
       }
     };
 
     scan();
-    workerScanTimer = setInterval(scan, BUTTON_SCAN_MS);
-    workerReloadTimer = setTimeout(() => location.reload(), REFRESH_MS);
+    workerScanTimer = setInterval(scan, SCAN_MS);
   }
 
   async function startController() {
@@ -367,17 +362,24 @@
     localStorage.removeItem(KEY_HIT);
     localStorage.setItem(KEY_ENABLED, '1');
 
+    for (let slot = 0; slot < WORKER_COUNT; slot++) {
+      for (const item of assignmentsForSlot(slot)) {
+        setStatus(item.tcin, `Queued on worker ${slot + 1}`);
+      }
+    }
+
     let opened = 0;
-    for (const item of ITEMS) {
-      const child = window.open(workerUrl(item), `tsw-${item.tcin}`);
+    for (let slot = 0; slot < WORKER_COUNT; slot++) {
+      const assigned = assignmentsForSlot(slot);
+      const child = window.open(workerUrl(assigned[0], slot, 0), `tsw-worker-${slot}`);
       if (child) opened += 1;
     }
 
     startBtn.disabled = true;
     stopBtn.disabled = false;
-    globalStatus.textContent = opened === ITEMS.length
-      ? `Running • ${opened} product watch tabs open`
-      : `Running • ${opened}/${ITEMS.length} tabs opened; allow pop-ups for target.com`;
+    globalStatus.textContent = opened === WORKER_COUNT
+      ? `Running • ${WORKER_COUNT} rotating workers covering all ${ITEMS.length} products`
+      : `Running • ${opened}/${WORKER_COUNT} workers opened; allow pop-ups for target.com`;
 
     refreshControllerRows();
   }
@@ -404,7 +406,8 @@
     stopBtn.disabled = true;
 
     try {
-      const productWindow = window.open(productUrl(hit.tcin), `tsw-${hit.tcin}`);
+      const name = Number.isInteger(hit.slot) ? `tsw-worker-${hit.slot}` : '_blank';
+      const productWindow = window.open(productUrl(hit.tcin), name);
       if (productWindow) productWindow.focus();
     } catch (_) {}
 
@@ -416,7 +419,8 @@
         });
         notification.onclick = () => {
           try {
-            const productWindow = window.open(productUrl(hit.tcin), `tsw-${hit.tcin}`);
+            const name = Number.isInteger(hit.slot) ? `tsw-worker-${hit.slot}` : '_blank';
+            const productWindow = window.open(productUrl(hit.tcin), name);
             if (productWindow) productWindow.focus();
           } catch (_) {}
           notification.close();
@@ -429,11 +433,7 @@
 
   function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, char => ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#039;'
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
     }[char]));
   }
 
@@ -445,7 +445,7 @@
       const status = readStatus(item.tcin);
       const row = document.createElement('div');
       row.style.cssText = 'padding:5px 0;border-top:1px solid #ddd;font:12px/1.35 system-ui,sans-serif;';
-      const statusText = status?.text || (enabled() ? 'Opening / waiting…' : 'Idle');
+      const statusText = status?.text || (enabled() ? 'Queued' : 'Idle');
       row.innerHTML = `
         <a href="${productUrl(item)}" target="_blank"><b>${item.tcin}</b></a><br>
         <span>${escapeHtml(statusText)}</span>
@@ -458,22 +458,13 @@
     const panel = document.createElement('div');
     panel.id = 'target-stockwatch-panel';
     panel.style.cssText = [
-      'position:fixed',
-      'right:14px',
-      'bottom:14px',
-      'z-index:2147483647',
-      'width:320px',
-      'background:#fff',
-      'color:#111',
-      'border:2px solid #cc0000',
-      'border-radius:10px',
-      'box-shadow:0 4px 18px rgba(0,0,0,.25)',
-      'padding:10px',
-      'font:13px/1.4 system-ui,sans-serif'
+      'position:fixed','right:14px','bottom:14px','z-index:2147483647','width:330px',
+      'background:#fff','color:#111','border:2px solid #cc0000','border-radius:10px',
+      'box-shadow:0 4px 18px rgba(0,0,0,.25)','padding:10px','font:13px/1.4 system-ui,sans-serif'
     ].join(';');
 
     panel.innerHTML = `
-      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.8</div>
+      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.9</div>
       <div id="tsw-global" style="margin-bottom:7px;">${enabled() ? 'Running' : 'Idle'}</div>
       <div style="display:flex;gap:6px;margin-bottom:8px;">
         <button id="tsw-start" style="cursor:pointer;padding:5px 9px;">Start</button>
@@ -481,7 +472,7 @@
       </div>
       <div id="tsw-rows"></div>
       <div style="margin-top:7px;font-size:11px;color:#555;">
-        Page-based • refresh ~${REFRESH_MS / 1000}s • Out of Stock veto • ${REQUIRED_STABLE_SCANS} stable actionable scans required
+        2 rotating workers • 3 products each • Out of Stock veto • no cart/API actions
       </div>
     `;
 
@@ -512,7 +503,7 @@
     }
   });
 
-  if (isWorker && currentItem) {
+  if (isWorker) {
     startWorker();
   } else {
     renderController();
