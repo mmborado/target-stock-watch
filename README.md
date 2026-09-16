@@ -4,10 +4,12 @@ A small Tampermonkey userscript for watching specific Target TCINs and attemptin
 
 ## Watched TCINs
 
-- `1011407490`
-- `1010892071`
-- `1010892075`
-- `1012422107`
+- `1010892076`
+- `1010892067`
+- `1010892068`
+- `1010892065`
+- `1010892069`
+- `1010892070`
 
 Edit the `ITEMS` array in `target_tcin_stockwatch.user.js` to add or remove products.
 
