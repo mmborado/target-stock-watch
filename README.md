@@ -13,7 +13,7 @@ Tampermonkey userscript for watching specific Target product pages and alerting 
 
 Edit the `ITEMS` array in `target_tcin_stockwatch.user.js` to add or remove products.
 
-## Current behavior (v0.7)
+## Current behavior (v0.8)
 
 The watcher is **page-based and alert-only**.
 
@@ -21,11 +21,16 @@ It does not call Target's cart API, does not call the old RedSky stock endpoint,
 
 When you click **Start**, the controller opens one Target product-page worker tab for each watched TCIN. Each worker reloads about every 3 seconds and looks for a purchase control such as **Preorder now**, **Ship it**, **Add to cart**, or **Pick it up**.
 
-v0.7 specifically resolves the **actual interactive button/control** inside Target's `data-test` wrappers before alerting. It rejects controls that are disabled, `aria-disabled`, inside a disabled ancestor, non-interactive via `pointer-events`, or otherwise blocked.
+v0.8 requires all of the following before an alert can fire:
 
-This fixes the false positive where Target showed a greyed-out Add to cart button but the older script treated its wrapper as available.
+1. The actual interactive purchase control is enabled/actionable.
+2. The page does **not** visibly show **Out of Stock** or **Sold Out** in the main product area.
+3. The page has had a short settle period so availability UI can finish rendering.
+4. The purchase control remains actionable across multiple consecutive scans.
 
-When the first watched product has an actionable purchase control, the script:
+If a visible **Out of Stock** state is present, it overrides any apparent purchase button and the worker reports `Out of Stock` instead of alerting.
+
+When the first watched product passes those checks, the script:
 
 1. Stops all watchers.
 2. Plays three alert beeps.
@@ -40,7 +45,7 @@ When the first watched product has an actionable purchase control, the script:
 3. Copy the full file contents into a new Tampermonkey userscript and save it.
 4. Log into Target in the same browser.
 5. Open any normal page on `https://www.target.com/`.
-6. A **Target Stock Watch v0.7** panel should appear in the bottom-right corner.
+6. A **Target Stock Watch v0.8** panel should appear in the bottom-right corner.
 7. Click **Start**.
 8. Allow browser notifications when prompted.
 9. If Chrome blocks some of the six worker tabs, allow pop-ups for `target.com` and click **Start** again.
@@ -48,5 +53,5 @@ When the first watched product has an actionable purchase control, the script:
 ## Notes
 
 - Product-page refreshes are heavier than lightweight API polling, so the refresh cadence is about 3 seconds rather than 1 second.
-- Target can change product-page markup at any time. If purchase-button structure changes, detection logic may need another update.
+- Target can change product-page markup at any time. If availability text or purchase-button structure changes, detection logic may need another update.
 - The script never performs a cart or checkout action.
