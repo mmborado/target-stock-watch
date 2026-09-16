@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Target Stock Watch (Page Alert Only)
 // @namespace    local.target.stockwatch
-// @version      0.6
-// @description  Watches Target product pages for a purchasable button, then alerts and opens/focuses the matching product page. No cart/API actions.
+// @version      0.7
+// @description  Watches Target product pages and alerts only when the real purchase control is actionable. No cart/API actions.
 // @match        https://www.target.com/*
 // @run-at       document-idle
 // @grant        none
@@ -20,7 +20,6 @@
     { tcin: '1010892070', label: 'Target item 1010892070' },
   ];
 
-  // Page-based checking is heavier than an API request, so keep this around 3s.
   const REFRESH_MS = 3000;
   const BUTTON_SCAN_MS = 200;
 
@@ -90,9 +89,7 @@
 
   function ensureAudio() {
     try {
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      }
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       if (audioCtx.state === 'suspended') audioCtx.resume();
     } catch (_) {}
   }
@@ -111,6 +108,10 @@
     } catch (_) {}
   }
 
+  function normalizeText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
   function visible(el) {
     if (!el) return false;
     const style = getComputedStyle(el);
@@ -120,20 +121,63 @@
       rect.width > 0 && rect.height > 0;
   }
 
-  function enabledButton(el) {
-    return !!el &&
-      visible(el) &&
-      !el.disabled &&
-      el.getAttribute('aria-disabled') !== 'true';
+  function resolveInteractiveControl(node) {
+    if (!node) return null;
+
+    if (node.matches?.('button, a, [role="button"]')) return node;
+
+    const child = node.querySelector?.('button, a, [role="button"]');
+    if (child) return child;
+
+    return node.closest?.('button, a, [role="button"]') || null;
   }
 
-  function normalizeText(value) {
-    return String(value || '').replace(/\s+/g, ' ').trim();
+  function isActuallyActionable(control) {
+    if (!control || !visible(control)) return false;
+
+    if (control.matches?.(':disabled')) return false;
+    if ('disabled' in control && control.disabled) return false;
+    if (control.hasAttribute?.('disabled')) return false;
+
+    const ariaDisabled = control.getAttribute?.('aria-disabled');
+    if (ariaDisabled && ariaDisabled.toLowerCase() === 'true') return false;
+
+    const disabledAncestor = control.closest?.(
+      '[aria-disabled="true"], [disabled], [data-disabled="true"]'
+    );
+    if (disabledAncestor && disabledAncestor !== control) return false;
+
+    const style = getComputedStyle(control);
+    if (style.pointerEvents === 'none') return false;
+
+    const classText = `${control.className || ''} ${control.parentElement?.className || ''}`.toLowerCase();
+    if (/\bdisabled\b/.test(classText)) return false;
+
+    const rect = control.getBoundingClientRect();
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1);
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1);
+
+    if (rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth) {
+      const topElement = document.elementFromPoint(x, y);
+      if (topElement && topElement !== control && !control.contains(topElement) && !topElement.contains(control)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  function candidateFromNode(node, selector) {
+    const control = resolveInteractiveControl(node);
+    if (!isActuallyActionable(control)) return null;
+
+    const text = normalizeText(control.innerText || control.textContent || node.innerText || node.textContent);
+    if (!/^(preorder now|preorder|ship it|add to cart|pick it up)$/i.test(text)) return null;
+
+    return { el: control, text, selector };
   }
 
   function findPurchaseControl() {
-    // Prefer Target-specific PDP hooks. These are much less likely to match
-    // recommendation-card buttons elsewhere on the page.
     const selectors = [
       '[data-test="preorderButton"]',
       '[data-test="shipItButton"]',
@@ -142,32 +186,26 @@
     ];
 
     for (const selector of selectors) {
-      const el = document.querySelector(selector);
-      if (enabledButton(el)) {
-        return {
-          el,
-          text: normalizeText(el.innerText || el.textContent || selector),
-          selector
-        };
+      const nodes = [...document.querySelectorAll(selector)];
+      for (const node of nodes) {
+        const candidate = candidateFromNode(node, selector);
+        if (candidate) return candidate;
       }
     }
 
-    // Fallback if Target changes data-test names. Limit to buttons near the
-    // top/main PDP area to avoid recommendation carousels lower on the page.
-    const buttons = [...document.querySelectorAll('button')];
-    const match = buttons.find(button => {
-      if (!enabledButton(button)) return false;
+    const buttons = [...document.querySelectorAll('button, [role="button"]')];
+    for (const button of buttons) {
+      if (!isActuallyActionable(button)) continue;
       const rect = button.getBoundingClientRect();
-      if (rect.top > 1800) return false;
-      const text = normalizeText(button.innerText || button.textContent);
-      return /^(preorder now|preorder|ship it|add to cart|pick it up)$/i.test(text);
-    });
+      if (rect.top > 1800) continue;
 
-    return match ? {
-      el: match,
-      text: normalizeText(match.innerText || match.textContent),
-      selector: 'text-fallback'
-    } : null;
+      const text = normalizeText(button.innerText || button.textContent);
+      if (/^(preorder now|preorder|ship it|add to cart|pick it up)$/i.test(text)) {
+        return { el: button, text, selector: 'text-fallback' };
+      }
+    }
+
+    return null;
   }
 
   function emitHit(item, control) {
@@ -182,14 +220,12 @@
       at: Date.now()
     };
 
-    setStatus(item.tcin, `🟢 ${hit.buttonText} found @ ${nowTime()}`);
+    setStatus(item.tcin, `🟢 ${hit.buttonText} actionable @ ${nowTime()}`);
     localStorage.setItem(KEY_HIT, JSON.stringify(hit));
     localStorage.setItem(KEY_ENABLED, '0');
 
     stopWorkerTimers();
     renderWorkerBadge(`FOUND — ${hit.buttonText}`);
-
-    // This worker is already the matching product page. Bring it forward.
     try { window.focus(); } catch (_) {}
   }
 
@@ -297,8 +333,6 @@
     startBtn.disabled = false;
     stopBtn.disabled = true;
 
-    // Reuse/focus the already-open worker tab for this product. This avoids
-    // relying on a new popup at alert time.
     try {
       const productWindow = window.open(productUrl(hit.tcin), `tsw-${hit.tcin}`);
       if (productWindow) productWindow.focus();
@@ -369,7 +403,7 @@
     ].join(';');
 
     panel.innerHTML = `
-      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.6</div>
+      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.7</div>
       <div id="tsw-global" style="margin-bottom:7px;">${enabled() ? 'Running' : 'Idle'}</div>
       <div style="display:flex;gap:6px;margin-bottom:8px;">
         <button id="tsw-start" style="cursor:pointer;padding:5px 9px;">Start</button>
@@ -377,7 +411,7 @@
       </div>
       <div id="tsw-rows"></div>
       <div style="margin-top:7px;font-size:11px;color:#555;">
-        Page-based • refresh ~${REFRESH_MS / 1000}s • alert only • no API/cart actions
+        Page-based • refresh ~${REFRESH_MS / 1000}s • alerts only on actionable controls
       </div>
     `;
 
@@ -412,8 +446,6 @@
     startWorker();
   } else {
     renderController();
-
-    // Recover a hit if the controller tab was backgrounded when it happened.
     try {
       const existingHit = localStorage.getItem(KEY_HIT);
       if (existingHit) handleHit(JSON.parse(existingHit));
