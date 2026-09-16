@@ -16,7 +16,7 @@ Edit the `ITEMS` array in `target_tcin_stockwatch.user.js` to add or remove prod
 ## What it does
 
 - Runs on `target.com` while you are logged in.
-- Checks each configured TCIN approximately every 7.5 seconds.
+- Checks the configured TCINs on a fast loop with about a 2-second delay between completed cycles.
 - Uses Target's cart endpoint as the practical availability test.
 - If a product is accepted into the cart, it stops polling, plays an alert, sends a browser notification, and opens the Target cart.
 - If Target returns HTTP `429`, it backs off for 30 seconds before trying again.
