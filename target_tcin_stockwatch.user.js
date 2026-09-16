@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Target TCIN Stock Watch + Auto Add to Cart
 // @namespace    local.target.stockwatch
-// @version      0.1
+// @version      0.2
 // @description  Poll selected Target TCINs by attempting Add to Cart. Stops and opens cart on first success.
 // @match        https://www.target.com/*
 // @run-at       document-idle
@@ -13,10 +13,12 @@
 
   // ---- CONFIG ----
   const ITEMS = [
-    { tcin: '1011407490', label: 'Target item 1011407490' },
-    { tcin: '1010892071', label: 'Target item 1010892071' },
-    { tcin: '1010892075', label: 'Target item 1010892075' },
-    { tcin: '1012422107', label: 'Target item 1012422107' },
+    { tcin: '1010892076', label: 'Target item 1010892076' },
+    { tcin: '1010892067', label: 'Target item 1010892067' },
+    { tcin: '1010892068', label: 'Target item 1010892068' },
+    { tcin: '1010892065', label: 'Target item 1010892065' },
+    { tcin: '1010892069', label: 'Target item 1010892069' },
+    { tcin: '1010892070', label: 'Target item 1010892070' },
   ];
 
   // Current frontend key observed in Target's RedSky/cart API documentation.
