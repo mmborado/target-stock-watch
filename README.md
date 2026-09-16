@@ -13,7 +13,7 @@ Tampermonkey userscript for watching specific Target product pages and alerting 
 
 Edit the `ITEMS` array in `target_tcin_stockwatch.user.js` to add or remove products.
 
-## Current behavior (v0.9)
+## Current behavior (v1.0)
 
 The watcher is **page-based and alert-only**.
 
@@ -21,16 +21,12 @@ It does not call Target's cart API, does not call the old RedSky stock endpoint,
 
 ### Two rotating workers
 
-v0.9 uses only **two worker tabs** instead of trying to open six tabs at once. This avoids Chrome blocking the later pop-ups.
-
-The six watched products are split between the two workers:
+The watcher uses only **two worker tabs**. The six watched products are split between them:
 
 - Worker 1 rotates through 3 products.
 - Worker 2 rotates through the other 3 products.
 
-Each product moves through visible statuses such as `Queued`, `Checking`, `Out of Stock`, or `No actionable purchase control`, so every TCIN should eventually show that it has been checked.
-
-Each worker spends a few seconds on a product page, evaluates it, then navigates to the next assigned TCIN. A given product is therefore checked roughly once per worker rotation rather than having its own permanent tab.
+Each product moves through statuses such as `Queued`, `Checking`, `Out of Stock`, or `No actionable purchase control`.
 
 ## Availability checks
 
@@ -41,15 +37,22 @@ An alert can fire only when all of the following are true:
 3. The page has had a short settle period so Target's availability UI can finish rendering.
 4. The purchase control remains actionable across multiple consecutive scans.
 
-If a visible **Out of Stock** state is present, it overrides any apparent purchase button and the watcher reports `Out of Stock` instead of alerting.
+If a visible **Out of Stock** state is present, it overrides any apparent purchase button.
 
-When a product passes those checks, the script:
+## What happens on a hit
 
-1. Stops both workers.
-2. Plays three alert beeps.
-3. Sends a persistent desktop notification if browser notifications are allowed.
-4. Changes the controller tab title to identify the TCIN.
-5. Opens/focuses the worker tab on the matching Target product page.
+v1.0 fixes the reload loop that could occur in v0.9 when a product became available.
+
+When the first product passes the availability checks:
+
+1. The winning worker immediately cancels its scan and rotation timers.
+2. Global watching is disabled so the other worker stops too.
+3. One stock-hit event is published.
+4. The controller handles that event only once.
+5. The controller plays three alert beeps and sends a persistent desktop notification if allowed.
+6. The already-open winning worker is **focused without navigating or reloading it**.
+
+The winning worker remains on the detected product page. The script does not replace its URL with a new product URL, which prevents the previous controller/worker reload loop.
 
 ## Install
 
@@ -58,7 +61,7 @@ When a product passes those checks, the script:
 3. Copy the full file contents into a new Tampermonkey userscript and save it.
 4. Log into Target in the same browser.
 5. Open any normal page on `https://www.target.com/`.
-6. A **Target Stock Watch v0.9** panel should appear in the bottom-right corner.
+6. A **Target Stock Watch v1.0** panel should appear in the bottom-right corner.
 7. Click **Start**.
 8. Allow browser notifications when prompted.
 9. The script should open two worker tabs. If fewer than two open, allow pop-ups for `target.com` and click **Start** again.
