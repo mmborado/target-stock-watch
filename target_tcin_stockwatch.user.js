@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Target Stock Watch + Page Auto-Add
+// @name         Target Stock Watch (Alert Only)
 // @namespace    local.target.stockwatch
-// @version      0.4
-// @description  Watches selected Target product pages and clicks Target's own Add to cart / Preorder button when it appears.
+// @version      0.5
+// @description  Read-only Target stock watcher. Alerts and opens the product page when a watched TCIN becomes purchasable.
 // @match        https://www.target.com/*
 // @run-at       document-idle
 // @grant        none
@@ -20,70 +20,42 @@
     { tcin: '1010892070', label: 'Target item 1010892070' },
   ];
 
-  // Full-page refresh cadence for worker tabs. This uses Target's normal page flow
-  // instead of manufacturing cart API requests.
-  const REFRESH_MS = 3000;
-  const BUTTON_SCAN_MS = 200;
-  const POST_CLICK_CONFIRM_MS = 2500;
+  // Target frontend key observed in the current web client.
+  const API_KEY = '9f36aeafbe60771e321a7cc95a78140772ab3e96';
 
-  const KEY_ENABLED = 'tsw.enabled';
-  const KEY_HIT = 'tsw.hit';
-  const KEY_STATUS_PREFIX = 'tsw.status.';
+  // Read-only RedSky fulfillment polling.
+  const POLL_MS = 2000;
+  const BETWEEN_ITEMS_MS = 100;
+  const PRICING_STORE_ID = '2421';
+  const BACKOFF_MS = 30000;
 
+  const PURCHASABLE = new Set([
+    'IN_STOCK',
+    'LIMITED_STOCK',
+    'PRE_ORDER_SELLABLE'
+  ]);
+
+  let running = false;
+  let timer = null;
+  let cycleCount = 0;
   let audioCtx = null;
-  let controllerTimer = null;
-  let workerReloadTimer = null;
-  let workerScanTimer = null;
-  let clickedThisLoad = false;
+  let alertWindow = null;
+  let backoffUntil = 0;
+  let stoppedByHit = false;
 
-  const params = new URLSearchParams(location.search);
-  const workerFromQuery = params.get('tsw_worker') === '1';
-  const workerFromName = /^tsw-\d+$/.test(window.name);
-  const isWorker = workerFromQuery || workerFromName;
-  const currentTcin = getCurrentTcin();
-  const currentItem = ITEMS.find(item => item.tcin === currentTcin) || null;
+  const state = new Map(
+    ITEMS.map(item => [item.tcin, { status: 'Idle', checks: 0 }])
+  );
 
-  function getCurrentTcin() {
-    const match = location.pathname.match(/A-(\d+)/i);
-    return match ? match[1] : null;
-  }
-
-  function itemUrl(item) {
-    return `https://www.target.com/p/A-${item.tcin}?tsw_worker=1`;
-  }
-
-  function enabled() {
-    return localStorage.getItem(KEY_ENABLED) === '1';
-  }
-
-  function setStatus(tcin, text) {
-    const value = JSON.stringify({ text, at: Date.now() });
-    localStorage.setItem(`${KEY_STATUS_PREFIX}${tcin}`, value);
-  }
-
-  function readStatus(tcin) {
-    try {
-      const raw = localStorage.getItem(`${KEY_STATUS_PREFIX}${tcin}`);
-      return raw ? JSON.parse(raw) : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function emitHit(item, confirmed) {
-    const hit = {
-      tcin: item.tcin,
-      label: item.label,
-      confirmed,
-      at: Date.now()
-    };
-    localStorage.setItem(KEY_HIT, JSON.stringify(hit));
-    localStorage.setItem(KEY_ENABLED, '0');
-  }
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const nowTime = () => new Date().toLocaleTimeString();
+  const productUrl = tcin => `https://www.target.com/p/A-${tcin}`;
 
   function ensureAudio() {
     try {
-      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
       if (audioCtx.state === 'suspended') audioCtx.resume();
     } catch (_) {}
   }
@@ -102,301 +74,261 @@
     } catch (_) {}
   }
 
-  function visible(el) {
-    if (!el) return false;
-    const style = getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    return style.display !== 'none' &&
-      style.visibility !== 'hidden' &&
-      rect.width > 0 && rect.height > 0;
+  function openStandbyWindow() {
+    try {
+      if (alertWindow && !alertWindow.closed) return true;
+
+      // Opened directly from the Start button click so Chrome is less likely
+      // to block the eventual product-page navigation as a popup.
+      alertWindow = window.open('about:blank', 'target-stock-hit');
+
+      if (alertWindow) {
+        try {
+          alertWindow.document.title = 'Target Stock Watch — Standby';
+          alertWindow.document.body.innerHTML = `
+            <div style="font:16px system-ui,sans-serif;padding:24px;">
+              Target Stock Watch is running.<br><br>
+              This tab will open the product automatically when stock is detected.
+            </div>
+          `;
+        } catch (_) {}
+        return true;
+      }
+    } catch (_) {}
+
+    return false;
   }
 
-  function normalizeText(text) {
-    return String(text || '').replace(/\s+/g, ' ').trim();
+  function setStatus(tcin, status) {
+    const entry = state.get(tcin);
+    if (!entry) return;
+    entry.status = status;
+    renderRows();
   }
 
-  function findPurchaseButton() {
-    const buttons = [...document.querySelectorAll('button')];
-
-    // Prefer Target's first visible primary product action. The main PDP controls
-    // occur before recommendation carousels in the DOM in normal Target pages.
-    return buttons.find(button => {
-      if (button.disabled || !visible(button)) return false;
-      const text = normalizeText(button.innerText || button.textContent);
-      return /^(add to cart|preorder now)$/i.test(text);
-    }) || null;
+  function buildFulfillmentUrl(item) {
+    const url = new URL(
+      'https://redsky.target.com/redsky_aggregations/v1/web/pdp_fulfillment_v1'
+    );
+    url.searchParams.set('key', API_KEY);
+    url.searchParams.set('tcin', item.tcin);
+    url.searchParams.set('is_bot', 'false');
+    url.searchParams.set('pricing_store_id', PRICING_STORE_ID);
+    return url.toString();
   }
 
-  function cartConfirmationVisible() {
-    const buttons = [...document.querySelectorAll('button')];
-    if (buttons.some(button => /^(in cart|added)$/i.test(normalizeText(button.innerText)))) {
-      return true;
+  async function alertHit(item, availability, quantity) {
+    stoppedByHit = true;
+    running = false;
+    if (timer) clearTimeout(timer);
+
+    const qtyText = Number.isFinite(quantity) ? ` • qty ${quantity}` : '';
+    const message = `${item.tcin} is ${availability}${qtyText}`;
+
+    setStatus(item.tcin, `🟢 ${availability}${qtyText} @ ${nowTime()}`);
+    globalStatus.textContent = `FOUND: ${message}`;
+    document.title = `🟢 TARGET IN STOCK: ${item.tcin}`;
+
+    beep();
+    setTimeout(beep, 220);
+    setTimeout(beep, 440);
+
+    if ('Notification' in window && Notification.permission === 'granted') {
+      try {
+        const notification = new Notification('Target item is in stock', {
+          body: message,
+          requireInteraction: true
+        });
+        notification.onclick = () => {
+          window.focus();
+          window.open(productUrl(item.tcin), '_blank');
+          notification.close();
+        };
+      } catch (_) {}
     }
-
-    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
-    return dialogs.some(dialog => /added to cart|added/i.test(normalizeText(dialog.innerText)));
-  }
-
-  function stopWorkerTimers() {
-    if (workerReloadTimer) clearTimeout(workerReloadTimer);
-    if (workerScanTimer) clearInterval(workerScanTimer);
-    workerReloadTimer = null;
-    workerScanTimer = null;
-  }
-
-  async function handlePurchaseButton(button) {
-    if (clickedThisLoad || !enabled() || !currentItem) return;
-    clickedThisLoad = true;
-    stopWorkerTimers();
-
-    const buttonText = normalizeText(button.innerText || button.textContent);
-    setStatus(currentItem.tcin, `${buttonText} found — clicking`);
 
     try {
-      button.click();
+      if (alertWindow && !alertWindow.closed) {
+        alertWindow.location.href = productUrl(item.tcin);
+        alertWindow.focus();
+      } else {
+        window.open(productUrl(item.tcin), '_blank');
+      }
+    } catch (_) {
+      // The product link in the panel remains available as a fallback.
+    }
+
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  async function checkItem(item) {
+    const entry = state.get(item.tcin);
+    entry.checks += 1;
+    setStatus(item.tcin, `Checking… #${entry.checks}`);
+
+    try {
+      const res = await fetch(buildFulfillmentUrl(item), {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+        headers: {
+          'accept': 'application/json'
+        }
+      });
+
+      if (!res.ok) {
+        setStatus(item.tcin, `API ${res.status} @ ${nowTime()}`);
+
+        if (res.status === 429 || res.status === 403 || res.status >= 500) {
+          backoffUntil = Date.now() + BACKOFF_MS;
+        }
+        return false;
+      }
+
+      const data = await res.json();
+      const shipping = data?.data?.product?.fulfillment?.shipping_options;
+      const availability = shipping?.availability_status || 'UNKNOWN';
+      const quantity = shipping?.available_to_promise_quantity;
+      const qtyText = Number.isFinite(quantity) ? ` • qty ${quantity}` : '';
+
+      if (PURCHASABLE.has(availability)) {
+        await alertHit(item, availability, quantity);
+        return true;
+      }
+
+      setStatus(item.tcin, `${availability}${qtyText} @ ${nowTime()}`);
+      return false;
     } catch (err) {
-      clickedThisLoad = false;
-      setStatus(currentItem.tcin, `Click failed: ${err?.message || err}`);
-      scheduleWorkerReload();
+      setStatus(item.tcin, `Network error @ ${nowTime()}`);
+      console.warn('[Target Watch] Check failed', item.tcin, err);
+      return false;
+    }
+  }
+
+  async function cycle() {
+    if (!running) return;
+
+    if (Date.now() < backoffUntil) {
+      const seconds = Math.ceil((backoffUntil - Date.now()) / 1000);
+      globalStatus.textContent = `Backoff: ${seconds}s`;
+      timer = setTimeout(cycle, 1000);
       return;
     }
 
-    const started = Date.now();
-    let confirmed = false;
+    cycleCount += 1;
+    globalStatus.textContent = `Running • cycle ${cycleCount} • ${nowTime()}`;
 
-    while (Date.now() - started < POST_CLICK_CONFIRM_MS) {
-      await new Promise(resolve => setTimeout(resolve, 150));
-      if (cartConfirmationVisible()) {
-        confirmed = true;
-        break;
-      }
-    }
-
-    setStatus(
-      currentItem.tcin,
-      confirmed ? '✅ Target confirmed item added' : '🟡 Purchase button clicked — verify cart'
-    );
-    emitHit(currentItem, confirmed);
-
-    // Existing worker tab can navigate without popup permission.
-    setTimeout(() => {
-      location.assign('https://www.target.com/cart');
-    }, 500);
-  }
-
-  function scheduleWorkerReload() {
-    if (!enabled() || !currentItem) return;
-    workerReloadTimer = setTimeout(() => location.reload(), REFRESH_MS);
-  }
-
-  function startWorker() {
-    if (!currentItem) return;
-
-    if (!enabled()) {
-      renderWorkerBadge('Paused');
-      return;
-    }
-
-    setStatus(currentItem.tcin, `Watching @ ${new Date().toLocaleTimeString()}`);
-    renderWorkerBadge(`Watching ${currentItem.tcin}`);
-
-    const scan = () => {
-      if (!enabled()) {
-        stopWorkerTimers();
-        renderWorkerBadge('Stopped');
-        return;
-      }
-
-      const button = findPurchaseButton();
-      if (button) handlePurchaseButton(button);
-    };
-
-    scan();
-    workerScanTimer = setInterval(scan, BUTTON_SCAN_MS);
-    scheduleWorkerReload();
-  }
-
-  function renderWorkerBadge(text) {
-    let badge = document.getElementById('tsw-worker-badge');
-    if (!badge) {
-      badge = document.createElement('div');
-      badge.id = 'tsw-worker-badge';
-      badge.style.cssText = [
-        'position:fixed',
-        'right:12px',
-        'bottom:12px',
-        'z-index:2147483647',
-        'background:#fff',
-        'color:#111',
-        'border:2px solid #cc0000',
-        'border-radius:8px',
-        'padding:7px 10px',
-        'font:12px/1.3 system-ui,sans-serif',
-        'box-shadow:0 3px 12px rgba(0,0,0,.2)'
-      ].join(';');
-      document.body.appendChild(badge);
-    }
-    badge.textContent = `Target Watch: ${text}`;
-  }
-
-  function clearOldStatuses() {
     for (const item of ITEMS) {
-      localStorage.removeItem(`${KEY_STATUS_PREFIX}${item.tcin}`);
+      if (!running) return;
+      const hit = await checkItem(item);
+      if (hit || !running) return;
+      await sleep(BETWEEN_ITEMS_MS);
+    }
+
+    if (running) {
+      timer = setTimeout(cycle, POLL_MS);
     }
   }
 
-  async function startController() {
+  async function start() {
+    if (running) return;
+
     ensureAudio();
+    stoppedByHit = false;
+    backoffUntil = 0;
 
     if ('Notification' in window && Notification.permission === 'default') {
       try { await Notification.requestPermission(); } catch (_) {}
     }
 
-    clearOldStatuses();
-    localStorage.removeItem(KEY_HIT);
-    localStorage.setItem(KEY_ENABLED, '1');
+    const standbyOpened = openStandbyWindow();
 
-    let opened = 0;
-    for (const item of ITEMS) {
-      const child = window.open(itemUrl(item), `tsw-${item.tcin}`);
-      if (child) opened += 1;
-    }
-
+    running = true;
     startBtn.disabled = true;
     stopBtn.disabled = false;
-    globalStatus.textContent = opened === ITEMS.length
-      ? `Running • ${opened} watch tabs opened`
-      : `Running • opened ${opened}/${ITEMS.length}; allow Target pop-ups if needed`;
+    globalStatus.textContent = standbyOpened
+      ? 'Starting • auto-open window ready'
+      : 'Starting • popup blocked; use product link if alerted';
 
-    refreshControllerRows();
+    cycle();
   }
 
-  function stopController() {
-    localStorage.setItem(KEY_ENABLED, '0');
+  function stop() {
+    running = false;
+    if (timer) clearTimeout(timer);
+    timer = null;
     startBtn.disabled = false;
     stopBtn.disabled = true;
-    globalStatus.textContent = 'Stopped';
-    refreshControllerRows();
+    globalStatus.textContent = stoppedByHit ? globalStatus.textContent : `Stopped • ${nowTime()}`;
   }
 
-  function handleHit(hit) {
-    if (!hit || !hit.tcin) return;
-    beep();
-    setTimeout(beep, 180);
-    document.title = `🟢 TARGET: ${hit.tcin}`;
-
-    const message = hit.confirmed
-      ? `${hit.tcin} was confirmed added to the Target cart.`
-      : `${hit.tcin} became purchasable and Target's button was clicked. Verify the cart.`;
-
-    globalStatus.textContent = message;
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-
-    if ('Notification' in window && Notification.permission === 'granted') {
-      try {
-        new Notification('Target stock alert', {
-          body: message,
-          requireInteraction: true
-        });
-      } catch (_) {}
-    }
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, char => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#039;'
+    }[char]));
   }
 
-  function refreshControllerRows() {
+  function renderRows() {
     if (!rows) return;
     rows.innerHTML = '';
 
     for (const item of ITEMS) {
-      const status = readStatus(item.tcin);
+      const entry = state.get(item.tcin);
       const row = document.createElement('div');
       row.style.cssText = 'padding:5px 0;border-top:1px solid #ddd;font:12px/1.35 system-ui,sans-serif;';
-      const statusText = status?.text || (enabled() ? 'Opening / waiting…' : 'Idle');
-      row.innerHTML = `<b>${item.tcin}</b><br><span>${escapeHtml(statusText)}</span>`;
+      row.innerHTML = `
+        <a href="${productUrl(item.tcin)}" target="_blank"><b>${item.tcin}</b></a><br>
+        <span>${escapeHtml(entry.status)}</span>
+      `;
       rows.appendChild(row);
     }
   }
 
-  function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, c => ({
-      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#039;'
-    }[c]));
-  }
+  const panel = document.createElement('div');
+  panel.id = 'target-stockwatch-panel';
+  panel.style.cssText = [
+    'position:fixed',
+    'right:14px',
+    'bottom:14px',
+    'z-index:2147483647',
+    'width:305px',
+    'background:#fff',
+    'color:#111',
+    'border:2px solid #cc0000',
+    'border-radius:10px',
+    'box-shadow:0 4px 18px rgba(0,0,0,.25)',
+    'padding:10px',
+    'font:13px/1.4 system-ui,sans-serif'
+  ].join(';');
 
-  function renderController() {
-    const panel = document.createElement('div');
-    panel.id = 'target-stockwatch-panel';
-    panel.style.cssText = [
-      'position:fixed',
-      'right:14px',
-      'bottom:14px',
-      'z-index:2147483647',
-      'width:310px',
-      'background:#fff',
-      'color:#111',
-      'border:2px solid #cc0000',
-      'border-radius:10px',
-      'box-shadow:0 4px 18px rgba(0,0,0,.25)',
-      'padding:10px',
-      'font:13px/1.4 system-ui,sans-serif'
-    ].join(';');
+  panel.innerHTML = `
+    <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.5</div>
+    <div id="tsw-global" style="margin-bottom:7px;">Idle</div>
+    <div style="display:flex;gap:6px;margin-bottom:8px;">
+      <button id="tsw-start" style="cursor:pointer;padding:5px 9px;">Start</button>
+      <button id="tsw-stop" disabled style="cursor:pointer;padding:5px 9px;">Stop</button>
+    </div>
+    <div id="tsw-rows"></div>
+    <div style="margin-top:7px;font-size:11px;color:#555;">
+      Read-only • ~${POLL_MS / 1000}s between cycles • stops on first hit • no cart actions
+    </div>
+  `;
 
-    panel.innerHTML = `
-      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.4</div>
-      <div id="tsw-global" style="margin-bottom:7px;">${enabled() ? 'Running' : 'Idle'}</div>
-      <div style="display:flex;gap:6px;margin-bottom:8px;">
-        <button id="tsw-start" style="cursor:pointer;padding:5px 9px;">Start</button>
-        <button id="tsw-stop" style="cursor:pointer;padding:5px 9px;">Stop</button>
-        <a href="https://www.target.com/cart" style="margin-left:auto;align-self:center;" target="_blank">Cart</a>
-      </div>
-      <div id="tsw-rows"></div>
-      <div style="margin-top:7px;font-size:11px;color:#555;">
-        Worker tabs refresh about every ${REFRESH_MS / 1000}s and use Target's own purchase button.
-      </div>
-    `;
+  document.body.appendChild(panel);
 
-    document.body.appendChild(panel);
+  const globalStatus = panel.querySelector('#tsw-global');
+  const startBtn = panel.querySelector('#tsw-start');
+  const stopBtn = panel.querySelector('#tsw-stop');
+  const rows = panel.querySelector('#tsw-rows');
 
-    globalStatus = panel.querySelector('#tsw-global');
-    startBtn = panel.querySelector('#tsw-start');
-    stopBtn = panel.querySelector('#tsw-stop');
-    rows = panel.querySelector('#tsw-rows');
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
 
-    startBtn.addEventListener('click', startController);
-    stopBtn.addEventListener('click', stopController);
-
-    startBtn.disabled = enabled();
-    stopBtn.disabled = !enabled();
-    refreshControllerRows();
-
-    controllerTimer = setInterval(refreshControllerRows, 500);
-  }
-
-  let globalStatus = null;
-  let startBtn = null;
-  let stopBtn = null;
-  let rows = null;
-
-  window.addEventListener('storage', event => {
-    if (event.key === KEY_ENABLED && event.newValue !== '1' && isWorker) {
-      stopWorkerTimers();
-      renderWorkerBadge('Stopped');
-    }
-
-    if (event.key === KEY_HIT && event.newValue && !isWorker) {
-      try { handleHit(JSON.parse(event.newValue)); } catch (_) {}
-    }
-  });
-
-  if (isWorker && currentItem) {
-    startWorker();
-  } else {
-    renderController();
-
-    // Handle a hit that may have happened while the controller tab was backgrounded.
-    try {
-      const existingHit = localStorage.getItem(KEY_HIT);
-      if (existingHit) handleHit(JSON.parse(existingHit));
-    } catch (_) {}
-  }
+  renderRows();
+  console.log('[Target Watch] Loaded read-only watcher for:', ITEMS.map(i => i.tcin));
 })();
