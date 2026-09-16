@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Target Stock Watch (Page Alert Only)
 // @namespace    local.target.stockwatch
-// @version      0.7
-// @description  Watches Target product pages and alerts only when the real purchase control is actionable. No cart/API actions.
+// @version      0.8
+// @description  Watches Target product pages and alerts only when a real purchase control is actionable and no Out of Stock state is visible. No cart/API actions.
 // @match        https://www.target.com/*
 // @run-at       document-idle
 // @grant        none
@@ -22,6 +22,8 @@
 
   const REFRESH_MS = 3000;
   const BUTTON_SCAN_MS = 200;
+  const MIN_SETTLE_MS = 1200;
+  const REQUIRED_STABLE_SCANS = 3;
 
   const KEY_ENABLED = 'tsw.enabled';
   const KEY_HIT = 'tsw.hit';
@@ -32,6 +34,8 @@
   let workerReloadTimer = null;
   let workerScanTimer = null;
   let hitThisLoad = false;
+  let stableActionableScans = 0;
+  const workerStartedAt = Date.now();
 
   let globalStatus = null;
   let startBtn = null;
@@ -118,7 +122,44 @@
     const rect = el.getBoundingClientRect();
     return style.display !== 'none' &&
       style.visibility !== 'hidden' &&
+      style.opacity !== '0' &&
       rect.width > 0 && rect.height > 0;
+  }
+
+  function pageShowsOutOfStock() {
+    const directSelectors = [
+      '[data-test*="outOfStock" i]',
+      '[data-test*="out-of-stock" i]',
+      '[data-test*="soldOut" i]',
+      '[data-test*="sold-out" i]'
+    ];
+
+    for (const selector of directSelectors) {
+      for (const node of document.querySelectorAll(selector)) {
+        if (!visible(node)) continue;
+        const text = normalizeText(node.innerText || node.textContent);
+        if (/\bout of stock\b/i.test(text) || /\bsold out\b/i.test(text)) return true;
+      }
+    }
+
+    const root = document.querySelector('main') || document.body;
+    if (!root) return false;
+
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      const text = normalizeText(textNode.nodeValue);
+      if (!/^(out of stock|sold out)[.!]?$/i.test(text)) continue;
+
+      const parent = textNode.parentElement;
+      if (!parent || !visible(parent)) continue;
+
+      const rect = parent.getBoundingClientRect();
+      if (rect.top > 2000 || rect.bottom < 0) continue;
+      return true;
+    }
+
+    return false;
   }
 
   function resolveInteractiveControl(node) {
@@ -210,6 +251,7 @@
 
   function emitHit(item, control) {
     if (hitThisLoad || !enabled()) return;
+    if (pageShowsOutOfStock()) return;
     hitThisLoad = true;
 
     const hit = {
@@ -220,7 +262,7 @@
       at: Date.now()
     };
 
-    setStatus(item.tcin, `🟢 ${hit.buttonText} actionable @ ${nowTime()}`);
+    setStatus(item.tcin, `🟢 ${hit.buttonText} actionable; no Out of Stock state @ ${nowTime()}`);
     localStorage.setItem(KEY_HIT, JSON.stringify(hit));
     localStorage.setItem(KEY_ENABLED, '0');
 
@@ -277,8 +319,36 @@
         return;
       }
 
+      if (pageShowsOutOfStock()) {
+        stableActionableScans = 0;
+        setStatus(currentItem.tcin, `Out of Stock @ ${nowTime()}`);
+        renderWorkerBadge('Out of Stock');
+        return;
+      }
+
+      if (Date.now() - workerStartedAt < MIN_SETTLE_MS) {
+        stableActionableScans = 0;
+        renderWorkerBadge(`Checking ${currentItem.tcin}`);
+        return;
+      }
+
       const control = findPurchaseControl();
-      if (control) emitHit(currentItem, control);
+      if (!control) {
+        stableActionableScans = 0;
+        setStatus(currentItem.tcin, `No actionable purchase control @ ${nowTime()}`);
+        renderWorkerBadge(`Watching ${currentItem.tcin}`);
+        return;
+      }
+
+      stableActionableScans += 1;
+      setStatus(
+        currentItem.tcin,
+        `${control.text} actionable (${stableActionableScans}/${REQUIRED_STABLE_SCANS}) @ ${nowTime()}`
+      );
+
+      if (stableActionableScans >= REQUIRED_STABLE_SCANS && !pageShowsOutOfStock()) {
+        emitHit(currentItem, control);
+      }
     };
 
     scan();
@@ -403,7 +473,7 @@
     ].join(';');
 
     panel.innerHTML = `
-      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.7</div>
+      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.8</div>
       <div id="tsw-global" style="margin-bottom:7px;">${enabled() ? 'Running' : 'Idle'}</div>
       <div style="display:flex;gap:6px;margin-bottom:8px;">
         <button id="tsw-start" style="cursor:pointer;padding:5px 9px;">Start</button>
@@ -411,7 +481,7 @@
       </div>
       <div id="tsw-rows"></div>
       <div style="margin-top:7px;font-size:11px;color:#555;">
-        Page-based • refresh ~${REFRESH_MS / 1000}s • alerts only on actionable controls
+        Page-based • refresh ~${REFRESH_MS / 1000}s • Out of Stock veto • ${REQUIRED_STABLE_SCANS} stable actionable scans required
       </div>
     `;
 
