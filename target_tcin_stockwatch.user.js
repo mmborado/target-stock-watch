@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Target Stock Watch (Page Alert Only)
 // @namespace    local.target.stockwatch
-// @version      0.9
-// @description  Uses two rotating Target product-page workers to watch six TCINs. Alerts only when a real purchase control is actionable and no Out of Stock state is visible.
+// @version      1.0
+// @description  Uses two rotating Target product-page workers to watch six TCINs. Stops cleanly and alerts once when a real purchase control is actionable and no Out of Stock state is visible.
 // @match        https://www.target.com/*
 // @run-at       document-idle
 // @grant        none
@@ -30,6 +30,7 @@
   const KEY_ENABLED = 'tsw.enabled';
   const KEY_HIT = 'tsw.hit';
   const KEY_STATUS_PREFIX = 'tsw.status.';
+  const SESSION_LAST_HANDLED_HIT = 'tsw.lastHandledHit';
 
   let audioCtx = null;
   let controllerTimer = null;
@@ -38,6 +39,7 @@
   let hitThisLoad = false;
   let stableActionableScans = 0;
   let rotating = false;
+  let workerWindows = new Map();
   const workerStartedAt = Date.now();
 
   let globalStatus = null;
@@ -257,7 +259,7 @@
   }
 
   function rotateToNext() {
-    if (rotating || !enabled()) return;
+    if (rotating || !enabled() || hitThisLoad) return;
     rotating = true;
     stopWorkerTimers();
 
@@ -269,6 +271,7 @@
     setStatus(nextItem.tcin, `Queued on worker ${workerSlot + 1} @ ${nowTime()}`);
 
     rotateTimer = setTimeout(() => {
+      if (!enabled() || hitThisLoad) return;
       location.replace(workerUrl(nextItem, workerSlot, nextPos));
     }, ROTATE_DELAY_MS);
   }
@@ -276,8 +279,11 @@
   function emitHit(item, control) {
     if (hitThisLoad || !enabled() || pageShowsOutOfStock()) return;
     hitThisLoad = true;
+    rotating = true;
+    stopWorkerTimers();
 
     const hit = {
+      id: `${item.tcin}-${Date.now()}`,
       tcin: item.tcin,
       label: item.label,
       buttonText: control.text || 'Purchasable',
@@ -286,9 +292,11 @@
     };
 
     setStatus(item.tcin, `🟢 ${hit.buttonText} actionable; no Out of Stock state @ ${nowTime()}`);
-    localStorage.setItem(KEY_HIT, JSON.stringify(hit));
+
+    // Stop every worker before publishing the hit so no rotation can continue.
     localStorage.setItem(KEY_ENABLED, '0');
-    stopWorkerTimers();
+    localStorage.setItem(KEY_HIT, JSON.stringify(hit));
+
     renderWorkerBadge(`FOUND — ${hit.buttonText}`);
     try { window.focus(); } catch (_) {}
   }
@@ -300,6 +308,7 @@
     if (!assigned.some(item => item.tcin === currentItem.tcin)) return;
 
     if (!enabled()) {
+      stopWorkerTimers();
       renderWorkerBadge('Paused');
       return;
     }
@@ -308,9 +317,9 @@
     renderWorkerBadge(`Checking ${currentItem.tcin}`);
 
     const scan = () => {
-      if (!enabled()) {
+      if (hitThisLoad || !enabled()) {
         stopWorkerTimers();
-        renderWorkerBadge('Stopped');
+        renderWorkerBadge(hitThisLoad ? 'FOUND — stopped' : 'Stopped');
         return;
       }
 
@@ -360,7 +369,9 @@
 
     clearStatuses();
     localStorage.removeItem(KEY_HIT);
+    sessionStorage.removeItem(SESSION_LAST_HANDLED_HIT);
     localStorage.setItem(KEY_ENABLED, '1');
+    workerWindows = new Map();
 
     for (let slot = 0; slot < WORKER_COUNT; slot++) {
       for (const item of assignmentsForSlot(slot)) {
@@ -372,7 +383,10 @@
     for (let slot = 0; slot < WORKER_COUNT; slot++) {
       const assigned = assignmentsForSlot(slot);
       const child = window.open(workerUrl(assigned[0], slot, 0), `tsw-worker-${slot}`);
-      if (child) opened += 1;
+      if (child) {
+        opened += 1;
+        workerWindows.set(slot, child);
+      }
     }
 
     startBtn.disabled = true;
@@ -392,8 +406,35 @@
     refreshControllerRows();
   }
 
+  function focusWinningWorker(hit) {
+    if (!Number.isInteger(hit.slot)) return;
+
+    try {
+      const directRef = workerWindows.get(hit.slot);
+      if (directRef && !directRef.closed) {
+        directRef.focus();
+        return;
+      }
+    } catch (_) {}
+
+    // Important: do not navigate the worker. Navigating it to a clean product URL
+    // caused v0.9 to reload as a controller and re-handle the stored hit forever.
+    try {
+      const existing = window.open('', `tsw-worker-${hit.slot}`);
+      if (existing && !existing.closed) existing.focus();
+    } catch (_) {}
+  }
+
   function handleHit(hit) {
     if (!hit || !hit.tcin) return;
+
+    const hitId = hit.id || `${hit.tcin}-${hit.at || ''}`;
+    if (sessionStorage.getItem(SESSION_LAST_HANDLED_HIT) === hitId) return;
+    sessionStorage.setItem(SESSION_LAST_HANDLED_HIT, hitId);
+
+    // Belt-and-suspenders stop. The winning worker already disabled the watch,
+    // but the controller also forces the global stop before doing anything else.
+    localStorage.setItem(KEY_ENABLED, '0');
 
     beep();
     setTimeout(beep, 220);
@@ -405,11 +446,7 @@
     startBtn.disabled = false;
     stopBtn.disabled = true;
 
-    try {
-      const name = Number.isInteger(hit.slot) ? `tsw-worker-${hit.slot}` : '_blank';
-      const productWindow = window.open(productUrl(hit.tcin), name);
-      if (productWindow) productWindow.focus();
-    } catch (_) {}
+    focusWinningWorker(hit);
 
     if ('Notification' in window && Notification.permission === 'granted') {
       try {
@@ -418,11 +455,7 @@
           requireInteraction: true
         });
         notification.onclick = () => {
-          try {
-            const name = Number.isInteger(hit.slot) ? `tsw-worker-${hit.slot}` : '_blank';
-            const productWindow = window.open(productUrl(hit.tcin), name);
-            if (productWindow) productWindow.focus();
-          } catch (_) {}
+          focusWinningWorker(hit);
           notification.close();
         };
       } catch (_) {}
@@ -464,7 +497,7 @@
     ].join(';');
 
     panel.innerHTML = `
-      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v0.9</div>
+      <div style="font-weight:800;font-size:14px;margin-bottom:4px;">Target Stock Watch v1.0</div>
       <div id="tsw-global" style="margin-bottom:7px;">${enabled() ? 'Running' : 'Idle'}</div>
       <div style="display:flex;gap:6px;margin-bottom:8px;">
         <button id="tsw-start" style="cursor:pointer;padding:5px 9px;">Start</button>
@@ -472,7 +505,7 @@
       </div>
       <div id="tsw-rows"></div>
       <div style="margin-top:7px;font-size:11px;color:#555;">
-        2 rotating workers • 3 products each • Out of Stock veto • no cart/API actions
+        2 rotating workers • stops on first hit • Out of Stock veto • no cart/API actions
       </div>
     `;
 
@@ -494,8 +527,9 @@
 
   window.addEventListener('storage', event => {
     if (event.key === KEY_ENABLED && event.newValue !== '1' && isWorker) {
+      rotating = true;
       stopWorkerTimers();
-      renderWorkerBadge('Stopped');
+      renderWorkerBadge(hitThisLoad ? 'FOUND — stopped' : 'Stopped');
     }
 
     if (event.key === KEY_HIT && event.newValue && !isWorker) {
