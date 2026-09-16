@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Target TCIN Stock Watch + Auto Add to Cart
 // @namespace    local.target.stockwatch
-// @version      0.2
+// @version      0.3
 // @description  Poll selected Target TCINs by attempting Add to Cart. Stops and opens cart on first success.
 // @match        https://www.target.com/*
 // @run-at       document-idle
@@ -25,9 +25,9 @@
   // Target can rotate this; if every request suddenly starts failing, this is one thing to re-check.
   const API_KEY = '9f36aeafbe60771e321a7cc95a78140772ab3e96';
 
-  // One cycle attempts all pending TCINs. 7.5s is intentionally not ultra-aggressive.
-  const POLL_MS = 7500;
-  const BETWEEN_ITEMS_MS = 250;
+  // Fast polling without running a one-second cart-write loop across all six items.
+  const POLL_MS = 2000;
+  const BETWEEN_ITEMS_MS = 100;
 
   // Stop everything after the first successful cart add, then open Target cart.
   const OPEN_CART_ON_SUCCESS = true;
@@ -202,8 +202,8 @@
     }
 
     if (running) {
-      const jitter = Math.floor(Math.random() * 1000) - 500;
-      timer = setTimeout(cycle, Math.max(3000, POLL_MS + jitter));
+      const jitter = Math.floor(Math.random() * 400) - 200;
+      timer = setTimeout(cycle, Math.max(1800, POLL_MS + jitter));
     }
   }
 
@@ -276,7 +276,7 @@
     </div>
     <div id="tsw-rows"></div>
     <div style="margin-top:7px;font-size:11px;color:#555;">
-      Poll: ${POLL_MS / 1000}s • Stops on first successful add.
+      Poll: ~${POLL_MS / 1000}s between cycles • Stops on first successful add.
     </div>
   `;
 
